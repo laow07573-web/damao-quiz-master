@@ -1,0 +1,320 @@
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import '../models/question.dart';
+import '../models/app_settings.dart';
+import 'database_service.dart';
+
+class AIService {
+  final AppSettings _settings;
+  final DatabaseService _db = DatabaseService.instance;
+  final http.Client _client = http.Client();
+
+  AIService(this._settings);
+
+  /// 使用 AI 从原始文本中批量解析题目
+  /// 返回结构化的 Question 列表
+  Future<List<Question>> parseQuestionsFromRawText(
+    String rawText,
+    int bankId,
+    void Function(int done, int total) onProgress,
+  ) async {
+    // 将文本按段落分块，每块控制在合理大小
+    final chunks = _splitTextIntoChunks(rawText, maxChars: 3000);
+    final allQuestions = <Question>[];
+    final now = DateTime.now().toIso8601String();
+
+    for (int i = 0; i < chunks.length; i++) {
+      onProgress(i, chunks.length);
+      final questions = await _parseChunkWithAI(chunks[i], bankId, now);
+      allQuestions.addAll(questions);
+    }
+
+    onProgress(chunks.length, chunks.length);
+    return allQuestions;
+  }
+
+  /// 将文本按大小分块
+  List<String> _splitTextIntoChunks(String text, {int maxChars = 3000}) {
+    final chunks = <String>[];
+    final paragraphs = text.split('\n');
+    var current = '';
+
+    for (final p in paragraphs) {
+      if (current.length + p.length > maxChars && current.isNotEmpty) {
+        chunks.add(current.trim());
+        current = p;
+      } else {
+        current += '\n$p';
+      }
+    }
+    if (current.trim().isNotEmpty) {
+      chunks.add(current.trim());
+    }
+    return chunks;
+  }
+
+  /// 用 AI 解析一个文本块中的题目
+  Future<List<Question>> _parseChunkWithAI(
+    String chunk, int bankId, String now) async {
+    final prompt = '''你是一个专业的题目解析器。请从以下文本中提取所有题目，返回严格的 JSON 格式。
+
+文本内容：
+$chunk
+
+每道题返回以下 JSON 结构：
+{
+  "questions": [
+    {
+      "title": "题目题干（去除题号）",
+      "options": ["选项A内容", "选项B内容", ...],
+      "correct_answer": "A/B/C/D/对/错/填空答案",
+      "question_type": "single_choice/multi_choice/true_false/fill_blank",
+      "analysis": "如果原文有解析则提取，否则留空"
+    }
+  ]
+}
+
+规则：
+1. 单选题：question_type="single_choice"，options 至少2个，correct_answer 如 "A"
+2. 多选题：question_type="multi_choice"，correct_answer 用逗号分隔如 "A,C"
+3. 判断题：question_type="true_false"，options 为空 []，correct_answer 为 "对" 或 "错"
+4. 填空题：question_type="fill_blank"，options 为空 []，correct_answer 为正确答案文本。题干的空白处通常有下划线____或括号（）
+5. 原文中的解析内容请保留到 analysis 字段
+6. 只返回 JSON，不要任何其他文字
+
+请直接返回 JSON：''';
+
+    try {
+      final response = await _client.post(
+        Uri.parse(_settings.apiEndpoint),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${_settings.apiKey}',
+        },
+        body: jsonEncode({
+          'model': _settings.model,
+          'messages': [
+            {
+              'role': 'system',
+              'content': '你是一个精确的 JSON 格式题目解析器。只返回合法 JSON，不返回任何其他内容。'
+            },
+            {'role': 'user', 'content': prompt},
+          ],
+          'temperature': 0.1,
+          'max_tokens': 4096,
+          'response_format': {'type': 'json_object'},
+        }),
+      ).timeout(const Duration(seconds: 60));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(response.bodyBytes));
+        final content = data['choices']?[0]?['message']?['content'] as String?;
+        if (content == null) return [];
+
+        // 解析 JSON 响应
+        final parsed = jsonDecode(content);
+        final questionsList = parsed['questions'] as List?;
+        if (questionsList == null) return [];
+
+        return questionsList.map((q) {
+          final opts = (q['options'] as List?)
+                  ?.map((o) => o.toString().trim())
+                  .where((o) => o.isNotEmpty)
+                  .toList() ??
+              [];
+          return Question(
+            bankId: bankId,
+            title: (q['title'] ?? '').toString().trim(),
+            options: opts,
+            correctAnswer: (q['correct_answer'] ?? '').toString().trim().toUpperCase(),
+            analysis: _nullIfEmpty(q['analysis']?.toString().trim()),
+            questionType: _detectType(q),
+            createdAt: now,
+          );
+        }).toList();
+      } else {
+        return [];
+      }
+    } catch (e) {
+      return [];
+    }
+  }
+
+  String? _nullIfEmpty(String? s) {
+    if (s == null || s.isEmpty) return null;
+    return s;
+  }
+
+  String _detectType(Map q) {
+    final answer = (q['correct_answer'] ?? '').toString();
+    if (answer.contains(',') && answer.length > 1) return 'multi_choice';
+    if (answer == '对' || answer == '错') return 'true_false';
+    final opts = q['options'];
+    return (opts is List && opts.isNotEmpty) ? 'single_choice' : 'true_false';
+  }
+
+  /// 获取题目解析（优先使用缓存）
+  Future<String> getAnalysis(Question question) async {
+    // 先查缓存
+    if (question.id != null) {
+      final cached = await _db.getCachedAnalysis(question.id!);
+      if (cached != null && cached.isNotEmpty) {
+        return cached;
+      }
+    }
+
+    // 调用 AI 生成解析
+    final analysis = await _callAIForAnalysis(question);
+
+    // 缓存结果
+    if (question.id != null && analysis.isNotEmpty) {
+      await _db.cacheAnalysis(question.id!, analysis);
+    }
+
+    return analysis;
+  }
+
+  /// 追问功能：基于原题和解析进行追问
+  Future<String> askFollowUp(Question question, String analysis,
+      String followUpQuestion) async {
+    final prompt = '''你是一个专业的答题解析助手。
+
+原题：${question.title}
+选项：
+${question.optionsWithLabels.join('\n')}
+正确答案：${question.correctAnswer}
+
+之前的解析：$analysis
+
+学生的追问：$followUpQuestion
+
+请针对学生的追问进行详细解答。
+
+禁止使用任何表格。不要输出 | - JSON 等表格相关符号。只输出纯文本段落。''';
+
+    return await _callAI(prompt);
+  }
+
+  /// 生成薄弱点分析
+  Future<String> generateWeaknessAnalysis(
+      List<Map<String, dynamic>> bankStats, double overallAccuracy) async {
+    if (bankStats.isEmpty) return '暂无刷题记录，无法生成薄弱点分析。';
+
+    final statsText = bankStats.map((s) {
+      final total = s['total'];
+      final correct = s['correct'];
+      final acc =
+          total > 0 ? ((correct / total) * 100).toStringAsFixed(1) : '0';
+      return '共$total题，正确$correct题，正确率${acc}%';
+    }).join('；');
+
+    final prompt = '''你是一个学习数据分析助手。根据数据诊断薄弱方向，给出具体建议。
+
+整体正确率：${overallAccuracy.toStringAsFixed(1)}%
+各科目数据：$statsText
+
+按以下格式回复（不提及题库名称，只说薄弱方向）：
+
+## 🎯 薄弱诊断
+根据正确率数据，指出需要加强的方向，如"**基础概念**部分薄弱，正确率仅xx%"、"**案例分析**能力不足"等
+
+## 📋 改进方向
+2-3条具体可操作的学习建议（不说题库名，说方向）
+
+## 💪 鼓励
+1句话鼓励
+
+控制在150字，用 ## 分标题，**粗体**突出关键数据。''';
+
+    return await _callAI(prompt);
+  }
+
+  /// 生成刷题小结
+  Future<String> generateSessionSummary(
+      int total, int correct, int wrong, int durationSeconds) async {
+    final accuracy = total > 0 ? ((correct / total) * 100).toStringAsFixed(1) : '0';
+    final minutes = durationSeconds ~/ 60;
+    final seconds = durationSeconds % 60;
+
+    final prompt = '''你是一个学习助手。为以下刷题结果生成小结：
+
+题量：$total 题 | 正确：$correct | 错误：$wrong | 正确率：${accuracy}% | 用时：${minutes}分${seconds}秒
+
+用下面格式回复（带emoji）：
+
+## 📊 本次表现
+一句话总结
+
+## ⚠️ 注意
+1条改进建议
+
+控制在80字以内。''';
+
+    return await _callAI(prompt);
+  }
+
+  /// 核心 AI 调用方法
+  Future<String> _callAIForAnalysis(Question question) async {
+    final prompt = '''请对以下题目进行详细解析：
+
+题目：${question.title}
+${question.options.isNotEmpty ? '选项：\n${question.optionsWithLabels.join('\n')}' : ''}
+正确答案：${question.correctAnswer}
+
+请按以下格式回复（可使用emoji增强可读性）：
+
+## 📌 考点分析
+简要说明这道题考察的知识点
+
+## 💡 解题思路
+详细说明解题步骤和推理过程
+
+## ✅ 答案详解
+为什么正确答案是对的，其他选项错在哪里
+
+## 📝 知识点总结
+这道题涉及的核心知识点
+
+注意：使用 ## 标题分段、**粗体**强调关键词。总字数控制在300字以内。''';
+
+    return await _callAI(prompt);
+  }
+
+  Future<String> _callAI(String userPrompt) async {
+    try {
+      final response = await _client.post(
+        Uri.parse(_settings.apiEndpoint),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${_settings.apiKey}',
+        },
+        body: jsonEncode({
+          'model': _settings.model,
+          'messages': [
+            {
+              'role': 'system',
+              'content': '你是一个专业的学习辅导助手，擅长解析题目、分析学习薄弱点，并提供针对性建议。'
+            },
+            {'role': 'user', 'content': userPrompt},
+          ],
+          'temperature': 0.7,
+          'max_tokens': 4096,
+        }),
+      ).timeout(const Duration(seconds: 30));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(response.bodyBytes));
+        final content = data['choices']?[0]?['message']?['content'] as String?;
+        return content ?? 'AI解析生成失败，请稍后重试。';
+      } else {
+        return 'AI服务返回错误 (${response.statusCode})，请检查API配置。';
+      }
+    } catch (e) {
+      return 'AI请求失败: ${e.toString()}';
+    }
+  }
+
+  void dispose() {
+    _client.close();
+  }
+}
