@@ -297,7 +297,7 @@ ${question.options.isNotEmpty ? '选项：\n${question.optionsWithLabels.join('\
             },
             {'role': 'user', 'content': userPrompt},
           ],
-          'temperature': 0.7,
+          'temperature': 0.3,
           'max_tokens': 4096,
         }),
       ).timeout(const Duration(seconds: 30));

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 
-/// 将 AI 回复渲染为富文本（支持标题、粗体、列表、表格）
+/// AI 回复渲染器：透传文本 → 零宽空格转义 → Markdown 解析 → 富文本
 class AiResponseWidget extends StatelessWidget {
   final String text;
   final double fontSize;
@@ -15,93 +16,28 @@ class AiResponseWidget extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: _parseBlocks(text),
-    );
-  }
-
-  List<Widget> _parseBlocks(String text) {
-    final widgets = <Widget>[];
-    final allLines = text.split('\n');
-    int i = 0;
-
-    while (i < allLines.length) {
-      final line = allLines[i].trim();
-
-      if (line.isEmpty) {
-        i++;
-        continue;
-      }
-
-      // 标题
-      if (line.startsWith('##')) {
-        widgets.add(Padding(
-          padding: const EdgeInsets.only(top: 10, bottom: 4),
-          child: Text(
-            line.replaceFirst(RegExp(r'^#+\s*'), ''),
-            style: TextStyle(
-                fontSize: fontSize + 2,
-                fontWeight: FontWeight.bold,
-                color: color),
-          ),
-        ));
-        i++;
-        continue;
-      }
-
-      // 粗体标题或序号
-      if (line.startsWith('**') || RegExp(r'^\d+[\.、]').hasMatch(line)) {
-        widgets.add(Padding(
-          padding: const EdgeInsets.only(top: 4, bottom: 2),
-          child: _buildRichLine(line),
-        ));
-        i++;
-        continue;
-      }
-
-      // 短横列表
-      if (line.startsWith('-') || line.startsWith('•')) {
-        widgets.add(Padding(
-          padding: const EdgeInsets.only(left: 8, top: 1, bottom: 1),
-          child: _buildRichLine(line),
-        ));
-        i++;
-        continue;
-      }
-
-      // 普通行
-      widgets.add(Padding(
-        padding: const EdgeInsets.only(bottom: 2),
-        child: _buildRichLine(line),
-      ));
-      i++;
-    }
-
-    return widgets;
-  }
-
-  Widget _buildRichLine(String line) {
-    final spans = <InlineSpan>[];
-    final text = line.trim();
-
-    final parts = text.split(RegExp(r'(\*\*[^*]+\*\*)'));
-    for (final part in parts) {
-      if (part.startsWith('**') && part.endsWith('**')) {
-        spans.add(TextSpan(
-          text: part.substring(2, part.length - 2),
-          style: TextStyle(fontWeight: FontWeight.bold, color: color),
-        ));
-      } else {
-        spans.add(TextSpan(text: part));
-      }
-    }
-
-    return RichText(
-      text: TextSpan(
-        style: TextStyle(fontSize: fontSize, color: color, height: 1.6),
-        children: spans,
+    return MarkdownBody(
+      data: _sanitize(text),
+      selectable: false,
+      styleSheet: MarkdownStyleSheet(
+        p: TextStyle(fontSize: fontSize, color: color, height: 1.6),
+        h1: TextStyle(fontSize: fontSize + 6, fontWeight: FontWeight.bold, color: color),
+        h2: TextStyle(fontSize: fontSize + 4, fontWeight: FontWeight.bold, color: color),
+        h3: TextStyle(fontSize: fontSize + 2, fontWeight: FontWeight.bold, color: color),
+        strong: TextStyle(fontSize: fontSize, fontWeight: FontWeight.bold, color: color),
+        code: TextStyle(fontSize: fontSize - 1, color: color),
+        listBullet: TextStyle(fontSize: fontSize, color: color),
+        tableBody: TextStyle(fontSize: fontSize - 1, color: color),
+        tableHead: TextStyle(fontSize: fontSize - 1, fontWeight: FontWeight.bold, color: color),
+        tableBorder: TableBorder.all(color: color.withOpacity(0.2)),
       ),
     );
+  }
+
+  String _sanitize(String raw) {
+    return raw
+        .replaceAll('\u200B', '')
+        .replaceAll('\u200C', '')
+        .replaceAll('\u200D', '');
   }
 }
